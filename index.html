@@ -1,0 +1,375 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="theme-color" content="#1b2340">
+<title>Arrow Tower</title>
+<style>
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent;-webkit-user-select:none;user-select:none}
+  html,body{margin:0;height:100%;overflow:hidden;overscroll-behavior:none;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;color:#fff}
+  body{background:radial-gradient(120% 90% at 50% 20%,#3b4a8a 0%,#1b2340 60%,#10152b 100%)}
+  #c{position:fixed;inset:0;width:100%;height:100%;display:block;touch-action:none}
+  #hud{position:fixed;left:0;right:0;top:0;display:flex;align-items:center;justify-content:space-between;
+       padding:calc(env(safe-area-inset-top,0px) + 10px) 14px 8px;pointer-events:none}
+  #hud>*{pointer-events:auto}
+  .pill{background:rgba(255,255,255,.12);backdrop-filter:blur(6px);border-radius:999px;padding:7px 14px;font-weight:700;font-size:16px}
+  #hearts{letter-spacing:3px;font-size:20px;line-height:1}
+  .heart{color:#ff5d73;transition:opacity .25s,transform .25s}
+  .heart.lost{opacity:.22;transform:scale(.8)}
+  #restart{border:0;color:#fff;font:inherit;font-weight:700;font-size:18px;cursor:pointer;width:44px;height:36px;padding:0}
+  #left{position:fixed;top:calc(env(safe-area-inset-top,0px) + 56px);left:0;right:0;text-align:center;font-size:13px;opacity:.7;pointer-events:none}
+  #hint{position:fixed;left:12px;right:12px;bottom:calc(env(safe-area-inset-bottom,0px) + 12px);text-align:center;font-size:13px;line-height:1.35;
+        background:rgba(0,0,0,.28);border-radius:14px;padding:9px 12px;pointer-events:none}
+  #hint b{color:#ffd166}
+  #overlay{position:fixed;inset:0;display:none;align-items:center;justify-content:center;background:rgba(10,14,32,.55);backdrop-filter:blur(3px)}
+  #overlay.show{display:flex}
+  #card{background:#232c55;border-radius:22px;padding:26px 30px;text-align:center;box-shadow:0 12px 40px rgba(0,0,0,.45);max-width:80vw}
+  #card h2{margin:0 0 6px;font-size:26px}
+  #card p{margin:0 0 18px;opacity:.8}
+  #card button{border:0;border-radius:999px;background:#ffd166;color:#2a2200;font-weight:800;font-size:18px;padding:12px 28px;cursor:pointer}
+  #err{position:fixed;inset:0;display:none;align-items:center;justify-content:center;text-align:center;padding:30px;font-size:16px}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hud">
+  <div class="pill" id="lvl">Level 1</div>
+  <div class="pill" id="hearts"></div>
+  <button class="pill" id="restart" title="Restart level" aria-label="Restart level">&#8635;</button>
+</div>
+<div id="left"></div>
+<div id="hint">Drag to spin. Tap an arrow to launch it &mdash; it only flies off if <b>nothing is in its way</b>:
+  &uarr;&darr; need a clear column to the top/bottom, &larr;&rarr; need a clear row to the <b>gold seam</b>.</div>
+<div id="overlay"><div id="card"><h2 id="ot"></h2><p id="op"></p><button id="ob"></button></div></div>
+<div id="err">Couldn't load 3D engine (Three.js from CDN). Check your connection and reload.</div>
+
+<script type="module">
+import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
+
+/*CORE_START*/
+// ---------- Pure game logic (no DOM / THREE) ----------
+// Board: rows (r=0 bottom) x cols (c=0..cols-1 around the tower). Cell holds an arrow object or null.
+// Directions: U (r+1), D (r-1), L (c-1), R (c+1). Columns do NOT wrap: the ring is cut at a "seam"
+// between column cols-1 and column 0. Left arrows run toward the seam via c=0, right arrows via c=cols-1.
+const DIRS = { U:{dr:1,dc:0}, D:{dr:-1,dc:0}, L:{dr:0,dc:-1}, R:{dr:0,dc:1} };
+const DIR_KEYS = ['U','D','L','R'];
+
+function mulberry32(a){return function(){a|=0;a=a+0x6D2B79F5|0;let t=Math.imul(a^a>>>15,1|a);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;};}
+
+function levelParams(level){
+  const L = Math.max(1, level|0);
+  return {
+    rows: Math.min(14, 5 + Math.floor((L-1)/2)),
+    cols: Math.min(12, 6 + Math.floor((L-1)/3)),
+    density: Math.min(0.72, 0.5 + 0.02*(L-1)),
+  };
+}
+
+// First arrow standing in the way of grid[r][c] moving along dir until it leaves the board; null = clear.
+function firstBlocker(grid, rows, cols, r, c, dir){
+  const d = DIRS[dir];
+  let rr = r + d.dr, cc = c + d.dc;
+  while (rr >= 0 && rr < rows && cc >= 0 && cc < cols){
+    if (grid[rr][cc]) return grid[rr][cc];
+    rr += d.dr; cc += d.dc;
+  }
+  return null;
+}
+
+// Generate by building the removal order in REVERSE: arrows are added one by one, and each new arrow
+// gets a direction whose path is clear of everything already on the board. Playing the arrows back in
+// reverse order of placement is therefore always a legal sequence => always solvable.
+function generateLevel(level){
+  const {rows, cols, density} = levelParams(level);
+  const rnd = mulberry32(level * 7919 + 13);
+  const grid = Array.from({length: rows}, () => Array(cols).fill(null));
+  const cells = [];
+  for (let r=0;r<rows;r++) for (let c=0;c<cols;c++) cells.push([r,c]);
+  for (let i=cells.length-1;i>0;i--){ const j=Math.floor(rnd()*(i+1)); [cells[i],cells[j]]=[cells[j],cells[i]]; }
+  const target = Math.max(3, Math.round(rows*cols*density));
+  const arrows = [];
+  for (const [r,c] of cells){
+    if (arrows.length >= target) break;
+    const order = DIR_KEYS.slice();
+    for (let i=order.length-1;i>0;i--){ const j=Math.floor(rnd()*(i+1)); [order[i],order[j]]=[order[j],order[i]]; }
+    for (const dir of order){
+      if (!firstBlocker(grid, rows, cols, r, c, dir)){
+        const a = {id: arrows.length, r, c, dir, alive: true};
+        grid[r][c] = a; arrows.push(a);
+        break;
+      }
+    }
+  }
+  return {rows, cols, arrows, grid, solution: arrows.slice().reverse().map(a=>a.id)};
+}
+
+// Greedy solver: removing an arrow can only unblock others, so greedy succeeds iff the level is solvable.
+function isSolvable(rows, cols, arrows){
+  const grid = Array.from({length: rows}, () => Array(cols).fill(null));
+  arrows.forEach(a => grid[a.r][a.c] = a);
+  let left = arrows.length, progress = true;
+  while (left > 0 && progress){
+    progress = false;
+    for (const a of arrows){
+      if (grid[a.r][a.c] === a && !firstBlocker(grid, rows, cols, a.r, a.c, a.dir)){
+        grid[a.r][a.c] = null; left--; progress = true;
+      }
+    }
+  }
+  return left === 0;
+}
+/*CORE_END*/
+
+// ---------- Rendering / UI ----------
+const $ = id => document.getElementById(id);
+const canvas = $('c');
+let renderer;
+try {
+  renderer = new THREE.WebGLRenderer({canvas, antialias:true, alpha:true});
+} catch(e){ $('err').style.display='flex'; throw e; }
+renderer.setPixelRatio(Math.min(window.devicePixelRatio||1, 2));
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(42, 1, 0.1, 200);
+scene.add(new THREE.HemisphereLight(0xffffff, 0x445577, 1.0));
+const sun = new THREE.DirectionalLight(0xffffff, 1.6); sun.position.set(4, 12, 10); scene.add(sun);
+
+const ARROW_COLORS = {U:0xff7a8a, D:0x4cc9f0, L:0xffb703, R:0x80ed99};
+const TILE_COLOR = 0xf4efe6;
+const W = 1;                 // tile size
+const arrowShape = (() => {
+  const s = new THREE.Shape();
+  s.moveTo(0,.36); s.lineTo(.28,0); s.lineTo(.11,0); s.lineTo(.11,-.34);
+  s.lineTo(-.11,-.34); s.lineTo(-.11,0); s.lineTo(-.28,0); s.closePath();
+  return new THREE.ExtrudeGeometry(s, {depth:.05, bevelEnabled:false});
+})();
+const tileGeo = new THREE.BoxGeometry(.88*W, .88*W, .1);
+const ROT = {U:0, L:Math.PI/2, D:Math.PI, R:-Math.PI/2};
+
+let tower = null;            // THREE.Group, spins about Y
+let pickables = [];
+let flying = [];
+let shaking = [];
+let level = 1, hearts = 3, state = null, locked = false, remaining = 0;
+let geo = null;              // {rows, cols, apothem, H}
+
+const MAX_HEARTS = 3;
+try { level = Math.max(1, parseInt(localStorage.getItem('arrowTower.level')) || 1); } catch(e){}
+function saveLevel(){ try { localStorage.setItem('arrowTower.level', String(level)); } catch(e){} }
+
+function disposeTower(){
+  if (!tower) return;
+  tower.traverse(o => { if (o.material) o.material.dispose && o.material.dispose(); });
+  scene.remove(tower);
+  tower = null;
+}
+
+function placeOnTower(a, theta, rad, y, tangOff){
+  const g = a.group;
+  const off = tangOff || 0;
+  g.position.set(Math.sin(theta)*rad + Math.cos(theta)*off, y, Math.cos(theta)*rad - Math.sin(theta)*off);
+  g.rotation.set(0, theta, 0);
+}
+
+function buildLevel(){
+  disposeTower();
+  flying = []; shaking = []; pickables = [];
+  state = generateLevel(level);
+  const {rows, cols} = state;
+  const R = W / (2*Math.sin(Math.PI/cols));
+  const apothem = R*Math.cos(Math.PI/cols);
+  const H = rows*W;
+  geo = {rows, cols, R, apothem, H};
+
+  tower = new THREE.Group();
+  const body = new THREE.Mesh(
+    new THREE.CylinderGeometry(R, R, H, cols, 1),
+    new THREE.MeshStandardMaterial({color:0x2e3a6e, roughness:.85, flatShading:true}));
+  body.position.y = H/2; tower.add(body); tower.userData.body = body;
+  const base = new THREE.Mesh(new THREE.CylinderGeometry(R+.5, R+.6, .5, 48),
+    new THREE.MeshStandardMaterial({color:0x1f2750, roughness:.9}));
+  base.position.y = -.25; tower.add(base);
+  const cap = new THREE.Mesh(new THREE.CylinderGeometry(R*.85, R, .3, cols),
+    new THREE.MeshStandardMaterial({color:0x3a4885, roughness:.8, flatShading:true}));
+  cap.position.y = H+.15; tower.add(cap);
+  // Seam strip: the exit for left/right arrows (theta = 0 edge, between col cols-1 and col 0)
+  const seam = new THREE.Mesh(new THREE.BoxGeometry(.14, H+.3, .14),
+    new THREE.MeshStandardMaterial({color:0xffd166, emissive:0xffb703, emissiveIntensity:.9}));
+  seam.position.set(0, H/2+.15, R); tower.add(seam);
+
+  const raise = .05;
+  for (const a of state.arrows){
+    const theta = (a.c + .5) * 2*Math.PI/cols;
+    const y = (a.r + .5) * W;
+    const g = new THREE.Group();
+    const tileMat = new THREE.MeshStandardMaterial({color:TILE_COLOR, roughness:.6});
+    const tile = new THREE.Mesh(tileGeo, tileMat);
+    const arrowMat = new THREE.MeshStandardMaterial({color:ARROW_COLORS[a.dir], roughness:.45});
+    const arrow = new THREE.Mesh(arrowShape, arrowMat);
+    arrow.position.z = .05; arrow.rotation.z = ROT[a.dir];
+    g.add(tile); g.add(arrow);
+    tile.userData.arrow = a;
+    a.group = g; a.tile = tile; a.tileMat = tileMat;
+    a.theta = theta; a.rad = apothem + raise; a.y = y;
+    placeOnTower(a, theta, a.rad, y);
+    tower.add(g);
+    pickables.push(tile);
+  }
+  scene.add(tower);
+  remaining = state.arrows.length;
+  hearts = MAX_HEARTS; locked = false;
+  tower.rotation.y = -Math.PI/cols; spinVel = 0;   // start with a tile face (not the seam) toward the camera
+  fitCamera();
+  updateHud();
+  $('overlay').classList.remove('show');
+}
+
+function fitCamera(){
+  if (!geo) return;
+  const w = innerWidth, h = innerHeight;
+  renderer.setSize(w, h, false);
+  const aspect = w/h; camera.aspect = aspect;
+  const t = Math.tan(THREE.MathUtils.degToRad(camera.fov/2));
+  const topUi = 90, botUi = 80;                       // px reserved for HUD + hint
+  const usable = Math.max(200, h - topUi - botUi);
+  const needH = (geo.H + 1.5) / 2;                    // half height to show, in world units
+  const distH = needH / t * (h/usable);
+  const distW = (geo.R + .8) / (t*aspect);
+  const dist = Math.max(distH, distW) + geo.R;
+  const cy = geo.H/2 + .4;
+  camera.position.set(0, cy + 1.0, dist);
+  camera.lookAt(0, cy, 0);
+  camera.updateProjectionMatrix();
+}
+addEventListener('resize', fitCamera);
+
+function updateHud(){
+  $('lvl').textContent = 'Level ' + level;
+  let s = '';
+  for (let i=0;i<MAX_HEARTS;i++) s += '<span class="heart'+(i>=hearts?' lost':'')+'">&#9829;</span>';
+  $('hearts').innerHTML = s;
+  $('left').textContent = remaining + ' arrow' + (remaining===1?'':'s') + ' left';
+}
+
+function showOverlay(title, text, btn, fn){
+  $('ot').textContent = title; $('op').textContent = text; $('ob').textContent = btn;
+  $('ob').onclick = fn; $('overlay').classList.add('show');
+}
+
+// ---------- Tap handling ----------
+function launch(a){
+  state.grid[a.r][a.c] = null; a.alive = false;
+  pickables.splice(pickables.indexOf(a.tile), 1);
+  flying.push({a, t:0});
+  remaining--; updateHud();
+  if (remaining === 0){
+    locked = true;
+    setTimeout(() => {
+      showOverlay('Level ' + level + ' cleared!', hearts + ' heart' + (hearts===1?'':'s') + ' left', 'Next level', () => {
+        level++; saveLevel(); buildLevel();
+      });
+    }, 900);
+  }
+}
+
+function blocked(a, blocker){
+  shaking.push({a, t:0, kind:'self'});
+  a.tileMat.color.set(0xff6b6b);
+  if (blocker){ shaking.push({a:blocker, t:0, kind:'other'}); blocker.tileMat.color.set(0xffc2c2); }
+  hearts--; updateHud();
+  if (hearts <= 0){
+    locked = true;
+    setTimeout(() => {
+      showOverlay('Out of hearts', 'Level ' + level + ' is waiting for you', 'Try again', buildLevel);
+    }, 700);
+  }
+}
+
+function handleTap(x, y){
+  if (locked || !state) return;
+  const rect = canvas.getBoundingClientRect();
+  const ndc = new THREE.Vector2(((x-rect.left)/rect.width)*2-1, -((y-rect.top)/rect.height)*2+1);
+  const ray = new THREE.Raycaster(); ray.setFromCamera(ndc, camera);
+  tower.updateMatrixWorld(true);
+  // include the tower body so arrows on the far side are occluded
+  const hits = ray.intersectObjects([tower.userData.body, ...pickables], false);
+  if (!hits.length) return;
+  const a = hits[0].object.userData.arrow;
+  if (!a || !a.alive) return;
+  const b = firstBlocker(state.grid, state.rows, state.cols, a.r, a.c, a.dir);
+  if (b) blocked(a, b); else launch(a);
+}
+
+// ---------- Spin (drag + inertia) ----------
+let spinVel = 0, dragging = false, pid = null, lastX = 0, lastT = 0, downX = 0, downY = 0, downT = 0, moved = 0;
+const SPIN_K = 0.011;       // radians per pixel
+canvas.addEventListener('pointerdown', e => {
+  if (dragging) return;
+  dragging = true; pid = e.pointerId; canvas.setPointerCapture(pid);
+  lastX = downX = e.clientX; downY = e.clientY; lastT = downT = performance.now(); moved = 0; spinVel = 0;
+});
+canvas.addEventListener('pointermove', e => {
+  if (!dragging || e.pointerId !== pid) return;
+  const now = performance.now(), dx = e.clientX - lastX;
+  moved = Math.max(moved, Math.hypot(e.clientX-downX, e.clientY-downY));
+  if (tower && moved > 6){
+    tower.rotation.y += dx * SPIN_K;
+    const dt = Math.max(1, now - lastT) / 1000;
+    spinVel = spinVel*0.6 + (dx*SPIN_K/dt)*0.4;
+  }
+  lastX = e.clientX; lastT = now;
+});
+function endDrag(e, cancelled){
+  if (!dragging || e.pointerId !== pid) return;
+  dragging = false;
+  const isTap = !cancelled && moved < 10 && performance.now() - downT < 500;
+  if (isTap){ spinVel = 0; handleTap(e.clientX, e.clientY); }
+  else if (performance.now() - lastT > 80) spinVel = 0;   // paused before release => no fling
+  spinVel = Math.max(-12, Math.min(12, spinVel));
+}
+canvas.addEventListener('pointerup', e => endDrag(e, false));
+canvas.addEventListener('pointercancel', e => endDrag(e, true));
+$('restart').addEventListener('click', () => buildLevel());
+
+// ---------- Animation loop ----------
+let prev = performance.now();
+function frame(now){
+  const dt = Math.min(0.05, (now - prev)/1000); prev = now;
+  if (tower){
+    if (!dragging){ tower.rotation.y += spinVel*dt; spinVel *= Math.exp(-3.2*dt); if (Math.abs(spinVel)<0.01) spinVel = 0; }
+    // fly-off
+    for (let i=flying.length-1;i>=0;i--){
+      const f = flying[i], a = f.a; f.t += dt; const t = f.t;
+      const dist = 3*t + 9*t*t;
+      let th = a.theta, rad = a.rad + 1.2*t, y = a.y;
+      if (a.dir==='U') y += dist;
+      else if (a.dir==='D') y -= dist;
+      else { th += (a.dir==='R'?1:-1) * dist/a.rad; rad = a.rad + 1 + 5*t*t; }
+      placeOnTower(a, th, rad, y);
+      a.group.rotateX(-0.6*t);
+      const s = t > 0.6 ? Math.max(0.001, 1 - (t-0.6)/0.4) : 1;
+      a.group.scale.setScalar(s);
+      if (t >= 1.0){ tower.remove(a.group); a.tileMat.dispose(); flying.splice(i,1); }
+    }
+    // shake
+    for (let i=shaking.length-1;i>=0;i--){
+      const s = shaking[i], a = s.a; s.t += dt;
+      const D = 0.42;
+      if (s.t >= D || !a.alive){
+        if (a.alive){ a.tileMat.color.set(TILE_COLOR); placeOnTower(a, a.theta, a.rad, a.y); }
+        shaking.splice(i,1); continue;
+      }
+      const amp = (s.kind==='self' ? 0.11 : 0.05) * (1 - s.t/D);
+      placeOnTower(a, a.theta, a.rad, a.y, Math.sin(s.t*55) * amp);
+    }
+  }
+  renderer.render(scene, camera);
+  requestAnimationFrame(frame);
+}
+
+buildLevel();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
